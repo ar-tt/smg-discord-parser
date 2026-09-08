@@ -20,6 +20,9 @@ DISCORD_API = "https://discord.com/api/v10"
 STATE_FILE = Path("state.json")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# Discord snowflake IDs encode a creation timestamp measured from 2015-01-01.
+DISCORD_EPOCH_MS = 1_420_070_400_000
+
 HEADERS = [
     "Timestamp (UTC)",
     "Channel",
@@ -40,6 +43,8 @@ CELL_LIMIT = 49_000
 def env(name, default=None, required=False):
     value = os.environ.get(name, default)
     if isinstance(value, str):
+        # Pasted secrets often carry a trailing newline, which is illegal in
+        # an HTTP header and produces a confusing InvalidHeader crash.
         value = value.strip()
     if required and not value:
         sys.exit(f"Missing required environment variable: {name}")
@@ -57,6 +62,34 @@ def load_state():
 
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+# --------------------------------------------------------------------------
+# Snowflake / cutoff handling
+# --------------------------------------------------------------------------
+
+def snowflake_for(moment):
+    """Lowest Discord message ID that could have been created at `moment`."""
+    ms = int(moment.timestamp() * 1000) - DISCORD_EPOCH_MS
+    if ms < 0:
+        return 0
+    return ms << 22
+
+
+def parse_cutoff(raw):
+    """Accept YYYY-MM-DD or a full ISO timestamp. Returns an aware datetime."""
+    if not raw:
+        return None
+    try:
+        moment = datetime.fromisoformat(raw)
+    except ValueError:
+        sys.exit(
+            f"ARCHIVE_SINCE is not a valid date: {raw!r}. "
+            "Use YYYY-MM-DD, for example 2026-09-01."
+        )
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
 
 
 # --------------------------------------------------------------------------
@@ -225,6 +258,7 @@ def main():
     tab = env("SHEET_TAB_NAME", "Sheet1")
     mode = env("SYNC_MODE", "new").strip().lower()
     cap = int(env("MAX_MESSAGES_PER_RUN", "2000"))
+    cutoff = parse_cutoff(env("ARCHIVE_SINCE", "2026-09-01"))
 
     channel_ids = [c.strip() for c in raw_channels.split(",") if c.strip()]
     if not channel_ids:
@@ -244,6 +278,9 @@ def main():
     state = load_state()
     grand_total = 0
 
+    if cutoff:
+        print(f"Ignoring anything before {cutoff:%Y-%m-%d %H:%M} UTC\n")
+
     for channel_id in channel_ids:
         name, guild_id = channel_info(session, channel_id)
         print(f"#{name} ({channel_id})")
@@ -252,8 +289,11 @@ def main():
 
         if cursor is None:
             if mode == "backfill":
-                cursor = "0"
-                print("    no cursor — backfilling from the start of the channel")
+                cursor = str(snowflake_for(cutoff)) if cutoff else "0"
+                if cutoff:
+                    print(f"    backfilling from {cutoff:%Y-%m-%d}")
+                else:
+                    print("    backfilling from the start of the channel")
             else:
                 state[channel_id] = latest_message_id(session, channel_id)
                 save_state(state)
@@ -262,6 +302,10 @@ def main():
 
         messages = fetch_messages_after(session, channel_id, cursor, cap)
         messages = [m for m in messages if m.get("type", 0) in KEEP_TYPES]
+
+        if cutoff:
+            floor = snowflake_for(cutoff)
+            messages = [m for m in messages if int(m["id"]) >= floor]
 
         if not messages:
             print("    nothing new")
