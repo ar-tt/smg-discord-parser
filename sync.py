@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Poll Discord channels over the REST API and append new messages to a Google Doc.
+"""Poll Discord channels over the REST API and append messages to a Google Sheet.
 
-Designed to run on a schedule (e.g. GitHub Actions cron). Keeps a per-channel
-cursor in state.json so each run only picks up what it hasn't seen before.
+One row per message. Designed to run on a schedule (e.g. GitHub Actions cron).
+A per-channel cursor in state.json means each run only picks up what's new.
 """
 
 import json
@@ -18,13 +18,23 @@ from googleapiclient.discovery import build
 
 DISCORD_API = "https://discord.com/api/v10"
 STATE_FILE = Path("state.json")
-SCOPES = ["https://www.googleapis.com/auth/documents"]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Google Docs rejects very large single inserts; split long appends into chunks.
-CHUNK_CHARS = 40_000
+HEADERS = [
+    "Timestamp (UTC)",
+    "Channel",
+    "Author",
+    "Message",
+    "Attachments",
+    "Link",
+    "Message ID",
+]
 
 # Discord message types worth archiving: 0 = default, 19 = inline reply.
 KEEP_TYPES = {0, 19}
+
+# Sheets caps a single cell at 50,000 characters.
+CELL_LIMIT = 49_000
 
 
 def env(name, default=None, required=False):
@@ -80,12 +90,14 @@ def discord_get(session, path, params=None):
     raise RuntimeError(f"Discord request failed after retries ({last_error}): {path}")
 
 
-def channel_label(session, channel_id):
+def channel_info(session, channel_id):
+    """Return (channel name, guild id). Falls back gracefully."""
     try:
-        return discord_get(session, f"/channels/{channel_id}").get("name", channel_id)
-    except Exception as exc:  # noqa: BLE001 - label is cosmetic, never fatal
-        print(f"    could not read channel name: {exc}")
-        return channel_id
+        data = discord_get(session, f"/channels/{channel_id}")
+        return data.get("name", channel_id), data.get("guild_id", "")
+    except Exception as exc:  # noqa: BLE001 - cosmetic, never fatal
+        print(f"    could not read channel details: {exc}")
+        return channel_id, ""
 
 
 def fetch_messages_after(session, channel_id, after_id, cap):
@@ -119,82 +131,98 @@ def latest_message_id(session, channel_id):
 
 
 # --------------------------------------------------------------------------
-# Formatting
+# Row building
 # --------------------------------------------------------------------------
 
-def format_message(message, channel_name):
+def build_row(message, channel_name, channel_id, guild_id):
     stamp = datetime.fromisoformat(message["timestamp"]).astimezone(timezone.utc)
     author = message["author"].get("global_name") or message["author"]["username"]
 
-    lines = [f"[{stamp:%Y-%m-%d %H:%M} UTC] #{channel_name} — {author}"]
+    body = (message.get("content") or "").strip()
+    if not body:
+        for embed in message.get("embeds", []):
+            label = embed.get("title") or embed.get("description") or embed.get("url")
+            if label:
+                body = f"[embed] {label}"
+                break
 
-    content = (message.get("content") or "").strip()
-    if content:
-        lines.append(content)
+    attachments = " | ".join(
+        a.get("url", "") for a in message.get("attachments", []) if a.get("url")
+    )
 
-    for attachment in message.get("attachments", []):
-        lines.append(f"    [file] {attachment.get('filename')} — {attachment.get('url')}")
+    link = (
+        f"https://discord.com/channels/{guild_id}/{channel_id}/{message['id']}"
+        if guild_id
+        else ""
+    )
 
-    for embed in message.get("embeds", []):
-        label = embed.get("title") or embed.get("url")
-        if label:
-            lines.append(f"    [embed] {label}")
-
-    if len(lines) == 1:
-        lines.append(
-            "    (empty — if this happens for every message, the Message Content "
-            "intent is not enabled)"
-        )
-
-    return "\n".join(lines) + "\n\n"
+    return [
+        stamp.strftime("%Y-%m-%d %H:%M:%S"),
+        channel_name,
+        author,
+        body[:CELL_LIMIT],
+        attachments[:CELL_LIMIT],
+        link,
+        message["id"],
+    ]
 
 
 # --------------------------------------------------------------------------
-# Google Docs
+# Google Sheets
 # --------------------------------------------------------------------------
 
-def docs_client():
+def sheets_client():
     raw = env("GOOGLE_CREDENTIALS", required=True)
     try:
         info = json.loads(raw)
     except json.JSONDecodeError:
         sys.exit("GOOGLE_CREDENTIALS is not valid JSON. Paste the whole key file.")
     creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-    return build("docs", "v1", credentials=creds, cache_discovery=False)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
-def doc_end_index(docs, doc_id):
-    doc = docs.documents().get(documentId=doc_id).execute()
-    # The trailing newline of the body segment is not a valid insert target.
-    return doc["body"]["content"][-1]["endIndex"] - 1
-
-
-def append_to_doc(docs, doc_id, text):
-    if not text:
+def ensure_headers(sheets, sheet_id, tab):
+    """Write the header row if the sheet is empty."""
+    existing = (
+        sheets.spreadsheets()
+        .values()
+        .get(spreadsheetId=sheet_id, range=f"{tab}!A1:G1")
+        .execute()
+        .get("values", [])
+    )
+    if existing:
         return
 
-    for start in range(0, len(text), CHUNK_CHARS):
-        chunk = text[start : start + CHUNK_CHARS]
-        index = doc_end_index(docs, doc_id)
-        docs.documents().batchUpdate(
-            documentId=doc_id,
-            body={
-                "requests": [
-                    {"insertText": {"location": {"index": index}, "text": chunk}}
-                ]
-            },
-        ).execute()
-        time.sleep(0.5)
+    sheets.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{tab}!A1",
+        valueInputOption="RAW",
+        body={"values": [HEADERS]},
+    ).execute()
+    print("    wrote header row")
+
+
+def append_rows(sheets, sheet_id, tab, rows):
+    if not rows:
+        return
+    sheets.spreadsheets().values().append(
+        spreadsheetId=sheet_id,
+        range=f"{tab}!A1",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": rows},
+    ).execute()
 
 
 # --------------------------------------------------------------------------
 
 def main():
     token = env("DISCORD_BOT_TOKEN", required=True)
-    doc_id = env("GOOGLE_DOC_ID", required=True)
+    sheet_id = env("GOOGLE_SHEET_ID", required=True)
     raw_channels = env("DISCORD_CHANNEL_IDS", required=True)
+    tab = env("SHEET_TAB_NAME", "Sheet1")
     mode = env("SYNC_MODE", "new").strip().lower()
-    cap = int(env("MAX_MESSAGES_PER_RUN", "500"))
+    cap = int(env("MAX_MESSAGES_PER_RUN", "2000"))
 
     channel_ids = [c.strip() for c in raw_channels.split(",") if c.strip()]
     if not channel_ids:
@@ -204,16 +232,18 @@ def main():
     session.headers.update(
         {
             "Authorization": f"Bot {token}",
-            "User-Agent": "DiscordArchive (github actions, 1.0)",
+            "User-Agent": "DiscordArchive (github actions, 2.0)",
         }
     )
 
-    docs = docs_client()
+    sheets = sheets_client()
+    ensure_headers(sheets, sheet_id, tab)
+
     state = load_state()
     grand_total = 0
 
     for channel_id in channel_ids:
-        name = channel_label(session, channel_id)
+        name, guild_id = channel_info(session, channel_id)
         print(f"#{name} ({channel_id})")
 
         cursor = state.get(channel_id)
@@ -235,22 +265,22 @@ def main():
             print("    nothing new")
             continue
 
-        text = "".join(format_message(m, name) for m in messages)
-        append_to_doc(docs, doc_id, text)
+        rows = [build_row(m, name, channel_id, guild_id) for m in messages]
+        append_rows(sheets, sheet_id, tab, rows)
 
         state[channel_id] = messages[-1]["id"]
         save_state(state)
 
         grand_total += len(messages)
-        print(f"    appended {len(messages)} message(s)")
+        print(f"    appended {len(messages)} row(s)")
 
     if grand_total >= cap:
         print(
             f"\nHit the {cap}-message cap. More history remains — "
-            "re-run until this stops appearing."
+            "re-run backfill until this stops appearing."
         )
 
-    print(f"\nDone. {grand_total} message(s) written.")
+    print(f"\nDone. {grand_total} row(s) written.")
 
 
 if __name__ == "__main__":
