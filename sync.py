@@ -222,7 +222,7 @@ def ensure_headers(sheets, sheet_id, tab):
         sheets.spreadsheets()
         .values()
         .get(spreadsheetId=sheet_id, range=f"{tab}!A1:G1")
-        .execute()
+        .execute(num_retries=5)
         .get("values", [])
     )
     if existing:
@@ -233,7 +233,7 @@ def ensure_headers(sheets, sheet_id, tab):
         range=f"{tab}!A1",
         valueInputOption="RAW",
         body={"values": [HEADERS]},
-    ).execute()
+    ).execute(num_retries=5)
     print("    wrote header row")
 
 
@@ -246,7 +246,7 @@ def append_rows(sheets, sheet_id, tab, rows):
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": rows},
-    ).execute()
+    ).execute(num_retries=5)
 
 
 # --------------------------------------------------------------------------
