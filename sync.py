@@ -39,6 +39,8 @@ CELL_LIMIT = 49_000
 
 def env(name, default=None, required=False):
     value = os.environ.get(name, default)
+    if isinstance(value, str):
+        value = value.strip()
     if required and not value:
         sys.exit(f"Missing required environment variable: {name}")
     return value
