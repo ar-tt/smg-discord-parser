@@ -1,7 +1,9 @@
-name: Discord to Google Doc
+name: Discord to Google Sheet
 
 on:
   schedule:
+    # Every 15 minutes. GitHub queues cron jobs on a best-effort basis, so
+    # actual runs can drift by 5-20 minutes during busy periods.
     - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
@@ -39,10 +41,10 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          GOOGLE_DOC_ID: ${{ vars.GOOGLE_DOC_ID }}
+          GOOGLE_SHEET_ID: ${{ vars.GOOGLE_SHEET_ID }}
           DISCORD_CHANNEL_IDS: ${{ vars.DISCORD_CHANNEL_IDS }}
           SYNC_MODE: ${{ inputs.mode || 'new' }}
-          MAX_MESSAGES_PER_RUN: "500"
+          MAX_MESSAGES_PER_RUN: "2000"
         run: python sync.py
 
       - name: Save cursor
