@@ -2,8 +2,8 @@ name: Discord to Google Sheet
 
 on:
   schedule:
-    # Every 15 minutes. GitHub queues cron jobs on a best-effort basis, so
-    # actual runs can drift by 5-20 minutes during busy periods.
+    # Hourly at :17. Odd minutes off the hour queue far better than */15,
+    # which GitHub throttles heavily on free shared runners.
     - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
