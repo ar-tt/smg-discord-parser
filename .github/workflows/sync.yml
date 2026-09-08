@@ -4,7 +4,7 @@ on:
   schedule:
     # Every 15 minutes. GitHub queues cron jobs on a best-effort basis, so
     # actual runs can drift by 5-20 minutes during busy periods.
-    - cron: "*/15 * * * *"
+    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       mode:
